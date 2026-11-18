@@ -3,7 +3,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use tracing::{info, warn};
+use tracing::info;
 
 use serde::{Deserialize, Serialize};
 
@@ -78,7 +78,7 @@ pub fn watch_power_source(
             .unwrap_or(PowerSource::Unknown);
         info!(?last, "initial power source");
         if last == PowerSource::Unknown {
-            warn!("unable to determine if powersource is constant or battery");
+            info!("unable to determine if powersource is constant or battery");
         }
         let _ = tx.send(last).await;
 

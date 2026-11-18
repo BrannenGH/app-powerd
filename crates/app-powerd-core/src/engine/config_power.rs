@@ -177,7 +177,7 @@ impl Engine {
         }
 
         let mode = &self.rules_engine.config().defaults.mode;
-        mode_for(self.effective_power_source(), mode.ac, mode.battery) == PowerMode::Enable
+        mode_for(self.effective_power_source(), mode) == PowerMode::Enable
     }
 
     pub(crate) fn thaw_all(&mut self) {
@@ -251,36 +251,38 @@ impl Engine {
 }
 
 /// The configured power mode.
-pub(crate) fn mode_for(source: PowerSource, ac: PowerMode, battery: PowerMode) -> PowerMode {
+pub(crate) fn mode_for(source: PowerSource, mode: &crate::config::ModeConfig) -> PowerMode {
     match source {
-        PowerSource::Battery => battery,
-        PowerSource::Ac | PowerSource::Unknown => ac,
+        PowerSource::Battery => mode.battery,
+        PowerSource::Ac => mode.ac,
+        PowerSource::Unknown => mode.unknown,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ModeConfig;
 
-    #[test]
-    fn unknown_power_source_follows_ac_mode() {
-        let (ac, battery) = (PowerMode::Disable, PowerMode::Enable);
-        assert_eq!(
-            mode_for(PowerSource::Unknown, ac, battery),
-            PowerMode::Disable
-        );
-        assert_eq!(mode_for(PowerSource::Ac, ac, battery), PowerMode::Disable);
-        assert_eq!(
-            mode_for(PowerSource::Battery, ac, battery),
-            PowerMode::Enable
-        );
+    fn modes(ac: PowerMode, battery: PowerMode, unknown: PowerMode) -> ModeConfig {
+        ModeConfig {
+            ac,
+            battery,
+            unknown,
+        }
     }
 
     #[test]
-    fn unknown_power_source_manages_when_ac_is_enabled() {
-        assert_eq!(
-            mode_for(PowerSource::Unknown, PowerMode::Enable, PowerMode::Disable),
-            PowerMode::Enable
-        );
+    fn unknown_power_source_follows_its_own_mode() {
+        let mode = modes(PowerMode::Disable, PowerMode::Enable, PowerMode::Enable);
+        assert_eq!(mode_for(PowerSource::Unknown, &mode), PowerMode::Enable);
+        assert_eq!(mode_for(PowerSource::Ac, &mode), PowerMode::Disable);
+        assert_eq!(mode_for(PowerSource::Battery, &mode), PowerMode::Enable);
+    }
+
+    #[test]
+    fn unknown_power_source_can_be_configured_off() {
+        let mode = modes(PowerMode::Enable, PowerMode::Enable, PowerMode::Disable);
+        assert_eq!(mode_for(PowerSource::Unknown, &mode), PowerMode::Disable);
     }
 }

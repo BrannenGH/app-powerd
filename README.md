@@ -122,6 +122,7 @@ app-powerd status
 #   power source:  battery (auto)
 #   cgroup mode:   SignalOnly
 #   cpu control:   unavailable (cpu_weight/cpu_quota are NOT applied)
+#   memory control: unavailable (memory_high/memory.reclaim are NOT applied)
 #   tracked apps:  11
 #   protected:     2
 #   uptime:        3821s
@@ -142,9 +143,13 @@ app-powerd thaw-all
 
 ### Config file
 
-Location: `~/.config/app-powerd/config.yaml` (respects `$XDG_CONFIG_HOME`).
+The daemon reads the first file that exists:
 
-If the file doesn't exist, built-in defaults are used. Reload without restart:
+1. `--config PATH`
+2. `~/.config/app-powerd/config.yaml` (respects `$XDG_CONFIG_HOME`)
+3. `/etc/app-powerd/config.yaml` (system-wide default; the RPM installs this)
+
+Reload without restart:
 
 ```bash
 app-powerd reload-config   # via IPC
@@ -168,8 +173,12 @@ All sections except `version` are optional — a minimal config is just `version
 | Field                         | Type     | Default   | Description                             |
 | ----------------------------- | -------- | --------- | --------------------------------------- |
 | `enabled`                     | bool     | `true`    | Master switch for the daemon            |
-| `mode.ac`                     | `enable` | `disable` | `disable`                               |
-| `mode.battery`                | `enable` | `disable` | `enable`                                |
+| `mode.ac`                     | `enable` \| `disable` | `disable` | Suspend while on wall power            |
+| `mode.battery`                | `enable` \| `disable` | `enable`  | Suspend while on battery               |
+| `mode.unknown`                | `enable` \| `disable` | `enable`  | Suspend when no battery is detected    |
+| `memory.available_min`        | size or `null` | `256M`   | Kill a background app below this `MemAvailable`. `null` disables |
+| `memory.psi_some_avg10`       | number or `null` | `40`  | Kill when PSI `some` avg10 reaches this percent. `null` disables |
+| `memory.kill_grace`           | Duration | `5s`      | `SIGTERM`, then `SIGKILL` after this   |
 | `timing.suspend_delay`        | Duration | `"30s"`   | Wait before suspending a background app |
 | `timing.resume_grace`         | Duration | `"3s"`    | Grace period after app is focused again |
 | `timing.min_suspend`          | Duration | `"5s"`    | Minimum time an app stays suspended     |
@@ -195,6 +204,8 @@ Profiles are named, reusable policy templates referenced by rules via `use_profi
 | `nice`               | i32 (`-20`..`19`)     | no         | Process niceness (throttle only)     |
 | `cpu_weight`         | u32 (`1`–`10000`)     | no         | Cgroup CPU weight (throttle only)    |
 | `cpu_quota`          | string (e.g. `"40%"`) | no         | Cgroup CPU quota (throttle only)     |
+| `memory_high`        | size (e.g. `256M`)    | no         | `memory.high` while backgrounded     |
+| `memory_reclaim`     | size or `all`         | no         | One-shot `memory.reclaim` on background/freeze |
 | `maintenance_resume` | object                | no         | Override maintenance resume settings |
 | `guards`             | object                | no         | Override guard settings              |
 
@@ -482,6 +493,8 @@ Type=simple
 ExecStart=%h/.local/bin/app-powerd run
 Restart=on-failure
 RestartSec=5
+Delegate=yes
+DelegateSubgroup=daemon
 
 [Install]
 WantedBy=default.target

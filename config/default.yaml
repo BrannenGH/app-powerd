@@ -41,8 +41,14 @@ defaults:
     dbus_refresh_interval: "5m"
 
   mode:
-    ac: disable
+    ac: enable
     battery: enable
+    unknown: enable
+
+  memory:
+    available_min: 256M
+    psi_some_avg10: 40
+    kill_grace: 5s
 
   timing:
     suspend_delay: "30s"
@@ -74,11 +80,13 @@ profiles:
   freeze:
     action: freeze
     suspend_delay: "60s"
+    memory_reclaim: all
 
   # Quick freeze for static viewers/file managers
   freeze-fast:
     action: freeze
     suspend_delay: "20s"
+    memory_reclaim: all
     guards:
       audio_active: ignore
       mic_active: ignore
@@ -113,6 +121,7 @@ profiles:
   messenger:
     action: freeze
     suspend_delay: "1m"
+    memory_reclaim: all
     maintenance_resume:
       enabled: true
       interval: "30s"
@@ -124,6 +133,7 @@ profiles:
   email:
     action: freeze
     suspend_delay: "3m"
+    memory_reclaim: all
     maintenance_resume:
       enabled: true
       interval: "5m"

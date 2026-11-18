@@ -134,6 +134,9 @@ pub enum IpcResponse {
         /// Whether `cpu_weight` / `cpu_quota` are enforced at all.
         #[serde(default)]
         cpu_control: bool,
+        /// Whether `memory.high` / `memory.reclaim` are enforced at all.
+        #[serde(default)]
+        memory_control: bool,
         /// Applications the built-in deny-list is refusing to manage.
         #[serde(default)]
         protected_apps: usize,

@@ -25,6 +25,7 @@ use rate_limit::{LogKey, RateLimiter};
 mod config_power;
 mod focus;
 mod ipc_handler;
+mod memory;
 mod rate_limit;
 mod reconcile;
 mod suspend;
@@ -54,6 +55,8 @@ const DBUS_SWEEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(3)
 
 /// How long an identical warning is suppressed after being emitted once.
 const LOG_SUPPRESSION_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+
+const MEMORY_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Events processed by the engine event loop.
 #[non_exhaustive]
@@ -107,6 +110,9 @@ pub enum EngineEvent {
     },
     /// A refreshed set of session-bus name owners, collected off the event loop.
     ProtectionRefreshed(std::collections::HashMap<u32, String>),
+    /// Sample memory pressure and, if it has crossed the configured line,
+    /// terminate the least recently used background application.
+    MemoryCheck,
     Shutdown,
 }
 
@@ -162,6 +168,8 @@ pub struct Engine {
     /// takes; without this, a slow `/proc` lets sweeps pile up, each holding a
     /// thread of the blocking pool.
     reconcile_in_flight: bool,
+    /// Applications we have already SIGTERMed and may still need to SIGKILL.
+    pending_kills: std::collections::HashMap<AppId, memory::PendingKill>,
 }
 
 impl Engine {
@@ -199,7 +207,10 @@ impl Engine {
         let exe_to_desktop = crate::system::process::build_desktop_index();
 
         let cgroup_mgr = CgroupManager::new();
-        cgroup_mgr.report_capabilities(&config.profiles_requiring_cpu_control());
+        cgroup_mgr.report_capabilities(
+            &config.profiles_requiring_cpu_control(),
+            &config.profiles_requiring_memory(),
+        );
         if let Some(dir) = journal.path().and_then(std::path::Path::parent) {
             cgroup_mgr.persist_origins_at(dir.join("cgroup-origins.json"));
         }
@@ -226,6 +237,7 @@ impl Engine {
             dbus_refresh_interval: config.defaults.protection.dbus_refresh_interval,
             last_dbus_refresh: None,
             reconcile_in_flight: false,
+            pending_kills: std::collections::HashMap::new(),
         };
 
         Ok((engine, event_tx))
@@ -248,6 +260,10 @@ impl Engine {
         // interrupted by a sweep over an empty registry.
         reconcile.tick().await;
 
+        let mut memory_check = tokio::time::interval(MEMORY_CHECK_INTERVAL);
+        memory_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        memory_check.tick().await;
+
         loop {
             let event = tokio::select! {
                 maybe_event = self.event_rx.recv() => match maybe_event {
@@ -255,6 +271,7 @@ impl Engine {
                     None => break,
                 },
                 _ = reconcile.tick() => EngineEvent::Reconcile,
+                _ = memory_check.tick() => EngineEvent::MemoryCheck,
             };
 
             match event {
@@ -277,6 +294,7 @@ impl Engine {
                     journal_dead,
                 } => self.apply_reconcile_result(reaped, journal_dead),
                 EngineEvent::ProtectionRefreshed(owners) => self.protection.apply_refresh(owners),
+                EngineEvent::MemoryCheck => self.handle_memory_check().await,
                 EngineEvent::IpcRequest { request, reply } => {
                     let response = self.handle_ipc(request);
                     if reply.send(response).is_err() {

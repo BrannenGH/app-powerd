@@ -86,4 +86,27 @@ impl SystemdManager {
             }
         }
     }
+
+    /// Set one transient-scope property (`CPUWeight`, `CPUQuotaPerSecUSec`, `MemoryHigh`).
+    pub fn set_u64_property(&self, unit: &str, key: &str, value: u64) -> Result<(), SystemError> {
+        let properties: Vec<(&str, Value<'_>)> = vec![(key, Value::from(value))];
+        match self.conn.call_method(
+            Some(SYSTEMD_BUS),
+            SYSTEMD_PATH,
+            Some(SYSTEMD_MANAGER_IFACE),
+            "SetUnitProperties",
+            &(unit, true, &properties),
+        ) {
+            Ok(_) => {
+                debug!(unit, key, value, "set scope property");
+                Ok(())
+            }
+            Err(e) => {
+                warn!(unit, key, error = %e, "failed to set scope property");
+                Err(SystemError::CgroupError {
+                    message: format!("SetUnitProperties {key} failed: {e}"),
+                })
+            }
+        }
+    }
 }
