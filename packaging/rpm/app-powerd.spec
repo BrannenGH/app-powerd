@@ -31,6 +31,7 @@ sed -e 's|^ExecStart=.*|ExecStart=%{_bindir}/app-powerd run|' \
     -e 's|^Documentation=.*|Documentation=%{url}|' \
     dist/app-powerd.service > app-powerd.service
 install -Dpm 0644 app-powerd.service %{buildroot}%{_userunitdir}/app-powerd.service
+install -Dpm 0644 config/default.yaml %{buildroot}%{_sysconfdir}/app-powerd/config.yaml
 
 %check
 "%{buildroot}%{_bindir}/app-powerd" --version
@@ -38,9 +39,14 @@ install -Dpm 0644 app-powerd.service %{buildroot}%{_userunitdir}/app-powerd.serv
 %files
 %license LICENSE
 %doc README.md config/default.yaml
+%dir %{_sysconfdir}/app-powerd
+%config(noreplace) %{_sysconfdir}/app-powerd/config.yaml
 %{_bindir}/app-powerd
 %{_userunitdir}/app-powerd.service
 
 %changelog
+* Wed Nov 18 2026 Brannen Hall - 2.0.3-1.kde
+- Install the default config as /etc/app-powerd/config.yaml
+
 * Mon Nov 16 2026 Brannen Hall - 1.2.0-1.kde
 - Package the KDE-enabled fork for repo.hallb.me

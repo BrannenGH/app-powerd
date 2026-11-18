@@ -4,6 +4,7 @@ pub(crate) mod matching;
 pub use loader::{config_path, load_config, load_config_or_default, watch_config};
 pub use matching::RulesEngine;
 
+use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -49,6 +50,7 @@ pub struct Defaults {
     #[serde(with = "humantime_serde")]
     pub reconcile_interval: Duration,
     pub protection: ProtectionConfig,
+    pub memory: MemoryConfig,
 }
 
 impl Default for Defaults {
@@ -61,8 +63,68 @@ impl Default for Defaults {
             guards: GuardsConfig::default(),
             reconcile_interval: Duration::from_secs(30),
             protection: ProtectionConfig::default(),
+            memory: MemoryConfig::default(),
         }
     }
+}
+
+/// When to terminate the least recently used background application.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemoryConfig {
+    /// Kill when `MemAvailable` drops below this many bytes.
+    #[serde(
+        default = "default_available_min",
+        deserialize_with = "de_opt_bytes",
+        serialize_with = "ser_opt_bytes"
+    )]
+    pub available_min: Option<u64>,
+    /// Kill when PSI `some` avg10 (percent) reaches this value.
+    #[serde(default = "default_psi_some_avg10")]
+    pub psi_some_avg10: Option<f64>,
+    /// `SIGTERM`, then `SIGKILL` if the process is still alive after this long.
+    #[serde(with = "humantime_serde", default = "default_kill_grace")]
+    pub kill_grace: Duration,
+}
+
+fn default_available_min() -> Option<u64> {
+    Some(DEFAULT_AVAILABLE_MIN)
+}
+
+fn default_psi_some_avg10() -> Option<f64> {
+    Some(DEFAULT_PSI_SOME_AVG10)
+}
+
+fn default_kill_grace() -> Duration {
+    Duration::from_secs(5)
+}
+
+const DEFAULT_AVAILABLE_MIN: u64 = 256 * 1024 * 1024;
+const DEFAULT_PSI_SOME_AVG10: f64 = 40.0;
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            available_min: default_available_min(),
+            psi_some_avg10: default_psi_some_avg10(),
+            kill_grace: default_kill_grace(),
+        }
+    }
+}
+
+impl MemoryConfig {
+    pub fn killer_enabled(&self) -> bool {
+        self.available_min.is_some() || self.psi_some_avg10.is_some()
+    }
+}
+
+/// How much to ask `memory.reclaim` to free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReclaimAmount {
+    /// Reclaim this many bytes.
+    Bytes(u64),
+    /// Reclaim whatever `memory.current` reports.
+    Current,
 }
 
 /// Tuning for the never-suspend protections.
@@ -95,13 +157,15 @@ impl Default for ProtectionConfig {
 pub struct ModeConfig {
     pub ac: PowerMode,
     pub battery: PowerMode,
+    pub unknown: PowerMode,
 }
 
 impl Default for ModeConfig {
     fn default() -> Self {
         Self {
-            ac: PowerMode::Disable,
+            ac: PowerMode::Enable,
             battery: PowerMode::Enable,
+            unknown: PowerMode::Enable,
         }
     }
 }
@@ -197,6 +261,18 @@ pub struct Profile {
     pub nice: Option<i32>,
     pub cpu_weight: Option<u32>,
     pub cpu_quota: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "de_opt_bytes",
+        serialize_with = "ser_opt_bytes"
+    )]
+    pub memory_high: Option<u64>,
+    #[serde(
+        default,
+        deserialize_with = "de_opt_reclaim",
+        serialize_with = "ser_opt_reclaim"
+    )]
+    pub memory_reclaim: Option<ReclaimAmount>,
     pub maintenance_resume: Option<MaintenanceResumeConfig>,
     pub guards: Option<GuardsConfig>,
 }
@@ -246,6 +322,18 @@ pub struct PolicyConfig {
     pub nice: Option<i32>,
     pub cpu_weight: Option<u32>,
     pub cpu_quota: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "de_opt_bytes",
+        serialize_with = "ser_opt_bytes"
+    )]
+    pub memory_high: Option<u64>,
+    #[serde(
+        default,
+        deserialize_with = "de_opt_reclaim",
+        serialize_with = "ser_opt_reclaim"
+    )]
+    pub memory_reclaim: Option<ReclaimAmount>,
     pub maintenance_resume: Option<MaintenanceResumeConfig>,
     pub guards: Option<GuardsConfig>,
 }
@@ -260,6 +348,8 @@ pub struct ResolvedPolicy {
     pub nice: Option<i32>,
     pub cpu_weight: Option<u32>,
     pub cpu_quota: Option<String>,
+    pub memory_high: Option<u64>,
+    pub memory_reclaim: Option<ReclaimAmount>,
     pub maintenance_resume: MaintenanceResumeConfig,
     pub guards: GuardsConfig,
     /// Id of the rule that matched, if any. Kept so `app-powerd list` can show
@@ -280,6 +370,8 @@ impl Default for ResolvedPolicy {
             nice: None,
             cpu_weight: None,
             cpu_quota: None,
+            memory_high: None,
+            memory_reclaim: None,
             maintenance_resume: MaintenanceResumeConfig::default(),
             guards: GuardsConfig::default(),
             matched_rule: None,
@@ -328,6 +420,14 @@ impl Config {
             .clone()
             .or_else(|| profile.and_then(|p| p.cpu_quota.clone()));
 
+        let memory_high = policy
+            .memory_high
+            .or_else(|| profile.and_then(|p| p.memory_high));
+
+        let memory_reclaim = policy
+            .memory_reclaim
+            .or_else(|| profile.and_then(|p| p.memory_reclaim));
+
         let maintenance_resume = policy
             .maintenance_resume
             .clone()
@@ -348,6 +448,8 @@ impl Config {
             nice,
             cpu_weight,
             cpu_quota,
+            memory_high,
+            memory_reclaim,
             maintenance_resume,
             guards,
             matched_rule: None,
@@ -368,6 +470,19 @@ impl Config {
         names
     }
 
+    /// Names of profiles that declare memory limits, used at startup to warn
+    /// when the memory controller is not available.
+    pub fn profiles_requiring_memory(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .profiles
+            .iter()
+            .filter(|(_, p)| p.memory_high.is_some() || p.memory_reclaim.is_some())
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
     /// Resolve the default policy (no rule matched).
     pub fn default_policy(&self) -> ResolvedPolicy {
         ResolvedPolicy {
@@ -378,6 +493,106 @@ impl Config {
             guards: self.defaults.guards.clone(),
             ..Default::default()
         }
+    }
+}
+
+/// Parse a byte size: a bare number of bytes, or a number with a `K`/`M`/`G`
+/// suffix (1024-based). An optional trailing `i` or `B` is accepted (`256M`,
+/// `256MB`, `256MiB`).
+pub fn parse_bytes(text: &str) -> Result<u64, String> {
+    let mut s = text.trim().to_ascii_lowercase();
+    if let Some(stripped) = s.strip_suffix('b') {
+        s = stripped.to_string();
+    }
+    if let Some(stripped) = s.strip_suffix('i') {
+        s = stripped.to_string();
+    }
+    let (number, mult) = if let Some(n) = s.strip_suffix('g') {
+        (n, 1024u64 * 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix('k') {
+        (n, 1024)
+    } else {
+        (s.as_str(), 1)
+    };
+    let number = number.trim();
+    if number.is_empty() {
+        return Err(format!("invalid byte size '{text}'"));
+    }
+    let value: u64 = number
+        .parse()
+        .map_err(|_| format!("invalid byte size '{text}'"))?;
+    value
+        .checked_mul(mult)
+        .ok_or_else(|| format!("byte size '{text}' overflows"))
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ByteValue {
+    Num(u64),
+    Str(String),
+}
+
+fn de_opt_bytes<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
+    let value = Option::<ByteValue>::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(ByteValue::Num(n)) => Ok(Some(n)),
+        Some(ByteValue::Str(text)) => parse_bytes(&text).map(Some).map_err(de::Error::custom),
+    }
+}
+
+fn ser_opt_bytes<S: serde::Serializer>(
+    value: &Option<u64>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match value {
+        Some(n) => serializer.serialize_u64(*n),
+        None => serializer.serialize_none(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ReclaimValue {
+    Bool(bool),
+    Num(u64),
+    Str(String),
+}
+
+fn de_opt_reclaim<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<ReclaimAmount>, D::Error> {
+    let value = Option::<ReclaimValue>::deserialize(deserializer)?;
+    match value {
+        None | Some(ReclaimValue::Bool(false)) => Ok(None),
+        Some(ReclaimValue::Bool(true)) => Ok(Some(ReclaimAmount::Current)),
+        Some(ReclaimValue::Num(n)) => Ok(Some(ReclaimAmount::Bytes(n))),
+        Some(ReclaimValue::Str(text)) => {
+            let lower = text.trim().to_ascii_lowercase();
+            if lower == "all" || lower == "current" || lower == "true" {
+                return Ok(Some(ReclaimAmount::Current));
+            }
+            if lower == "false" || lower.is_empty() {
+                return Ok(None);
+            }
+            parse_bytes(&text)
+                .map(|n| Some(ReclaimAmount::Bytes(n)))
+                .map_err(de::Error::custom)
+        }
+    }
+}
+
+fn ser_opt_reclaim<S: serde::Serializer>(
+    value: &Option<ReclaimAmount>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match value {
+        Some(ReclaimAmount::Bytes(n)) => serializer.serialize_u64(*n),
+        Some(ReclaimAmount::Current) => serializer.serialize_str("all"),
+        None => serializer.serialize_none(),
     }
 }
 
@@ -507,6 +722,8 @@ rules:
             nice: None,
             cpu_weight: None,
             cpu_quota: None,
+            memory_high: None,
+            memory_reclaim: None,
             maintenance_resume: None,
             guards: None,
         };
@@ -545,5 +762,91 @@ defaults:
             resolved.maintenance_resume.interval,
             Duration::from_secs(300)
         );
+    }
+
+    #[test]
+    fn unknown_power_mode_defaults_to_enable() {
+        let config: Config = serde_yaml_ng::from_str(
+            "version: 1\ndefaults:\n  mode:\n    ac: disable\n    battery: enable\n",
+        )
+        .unwrap();
+        assert_eq!(config.defaults.mode.unknown, PowerMode::Enable);
+        assert_eq!(config.defaults.mode.ac, PowerMode::Disable);
+        assert_eq!(
+            config.defaults.memory.available_min,
+            Some(256 * 1024 * 1024)
+        );
+        assert!(config.defaults.memory.killer_enabled());
+    }
+
+    #[test]
+    fn unknown_power_mode_can_be_disabled() {
+        let config: Config =
+            serde_yaml_ng::from_str("version: 1\ndefaults:\n  mode:\n    unknown: disable\n")
+                .unwrap();
+        assert_eq!(config.defaults.mode.unknown, PowerMode::Disable);
+    }
+
+    #[test]
+    fn memory_fields_resolve_from_profile() {
+        let yaml = r#"
+version: 1
+profiles:
+  freeze:
+    action: freeze
+    memory_high: 256M
+    memory_reclaim: all
+rules:
+  - id: viewer
+    match:
+      executable: [evince]
+    policy:
+      use_profile: freeze
+      memory_high: 128M
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        let resolved = config.resolve_policy(&config.rules[0].policy);
+        assert_eq!(resolved.memory_high, Some(128 * 1024 * 1024));
+        assert_eq!(resolved.memory_reclaim, Some(ReclaimAmount::Current));
+    }
+
+    #[test]
+    fn memory_killer_can_be_turned_off() {
+        let yaml = r#"
+version: 1
+defaults:
+  memory:
+    available_min: null
+    psi_some_avg10: null
+"#;
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        assert!(!config.defaults.memory.killer_enabled());
+        assert_eq!(config.defaults.memory.kill_grace, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn shipped_default_yaml_parses() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/default.yaml");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let config: Config = serde_yaml_ng::from_str(&text).unwrap();
+        assert_eq!(config.defaults.mode.unknown, PowerMode::Enable);
+        assert_eq!(
+            config.defaults.memory.available_min,
+            Some(256 * 1024 * 1024)
+        );
+        assert_eq!(
+            config.profiles["freeze"].memory_reclaim,
+            Some(ReclaimAmount::Current)
+        );
+    }
+
+    #[test]
+    fn parse_bytes_accepts_suffixes() {
+        assert_eq!(parse_bytes("256M").unwrap(), 256 * 1024 * 1024);
+        assert_eq!(parse_bytes("1G").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_bytes("512").unwrap(), 512);
+        assert_eq!(parse_bytes("2MiB").unwrap(), 2 * 1024 * 1024);
+        assert!(parse_bytes("nope").is_err());
     }
 }

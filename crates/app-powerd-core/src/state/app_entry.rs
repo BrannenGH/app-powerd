@@ -100,8 +100,12 @@ pub struct AppEntry {
 
     /// When the app entered its current state.
     pub(crate) state_since: Instant,
-    /// When the app was last active (for resume_grace).
+    /// When the app was last active (for resume_grace and the low-memory killer).
     pub(crate) last_active: Instant,
+    /// One-shot `memory.reclaim` already ran for this background stint.
+    pub(crate) memory_reclaimed: bool,
+    /// SIGTERM has been sent; don't freeze this app again while it exits.
+    pub(crate) killing: bool,
 
     /// Handle for the suspend_delay timer task (can be aborted).
     pub(crate) suspend_timer: Option<JoinHandle<()>>,
@@ -130,6 +134,8 @@ impl AppEntry {
             cgroup_path: None,
             state_since: now,
             last_active: now,
+            memory_reclaimed: false,
+            killing: false,
             suspend_timer: None,
             maintenance_timer: None,
         }
@@ -238,6 +244,8 @@ impl AppEntry {
         let now = Instant::now();
         if new_state == AppState::Active {
             self.last_active = now;
+            self.memory_reclaimed = false;
+            self.killing = false;
         }
         self.state = new_state;
         self.state_since = now;

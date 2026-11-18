@@ -121,6 +121,16 @@ pub(crate) fn signal_cont(pid: u32) -> Result<(), SystemError> {
     classify(pid, signal::kill(pid_to_nix(pid)?, Signal::SIGCONT))
 }
 
+pub(crate) fn signal_term(pid: u32) -> Result<(), SystemError> {
+    debug!(pid, "sending SIGTERM");
+    classify(pid, signal::kill(pid_to_nix(pid)?, Signal::SIGTERM))
+}
+
+pub(crate) fn signal_kill(pid: u32) -> Result<(), SystemError> {
+    debug!(pid, "sending SIGKILL");
+    classify(pid, signal::kill(pid_to_nix(pid)?, Signal::SIGKILL))
+}
+
 /// Collect the given PIDs plus all their descendants, as process identities.
 ///
 /// Blocking `/proc` walk — callers must run it off the event loop.

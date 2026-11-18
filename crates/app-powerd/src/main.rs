@@ -444,6 +444,7 @@ fn print_response(response: IpcResponse) -> Result<()> {
             uptime_secs,
             cgroup_mode,
             cpu_control,
+            memory_control,
             protected_apps,
             protocol_version,
         } => {
@@ -462,6 +463,14 @@ fn print_response(response: IpcResponse) -> Result<()> {
                     "available"
                 } else {
                     "unavailable (cpu_weight/cpu_quota are NOT applied)"
+                }
+            );
+            println!(
+                "  memory control: {}",
+                if memory_control {
+                    "available"
+                } else {
+                    "unavailable (memory_high/memory.reclaim are NOT applied)"
                 }
             );
             println!("  tracked apps:  {tracked_apps}");
@@ -507,6 +516,8 @@ fn print_response(response: IpcResponse) -> Result<()> {
                 "  warns_suppressed:      {}",
                 metrics.warns_suppressed_total
             );
+            println!("  memory_reclaims_total: {}", metrics.memory_reclaims_total);
+            println!("  apps_killed_total:     {}", metrics.apps_killed_total);
         }
         _ => {
             eprintln!("unexpected response from daemon");

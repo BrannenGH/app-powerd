@@ -18,6 +18,7 @@ KillSignal=SIGTERM
 
 KillMode=process
 Delegate=yes
+DelegateSubgroup=daemon
 
 # The freeze journal lives in $XDG_RUNTIME_DIR/app-powerd/, covered by
 # ReadWritePaths=%t below. It records what is suspended so a crashed daemon's

@@ -6,8 +6,11 @@ use tracing::{info, warn};
 use super::Config;
 use crate::error::ConfigError;
 
-/// Default config path: `$XDG_CONFIG_HOME/app-powerd/config.yaml`.
-pub fn config_path() -> PathBuf {
+/// System-wide config, read when the per-user file does not exist.
+pub const SYSTEM_CONFIG_PATH: &str = "/etc/app-powerd/config.yaml";
+
+/// Per-user config path: `$XDG_CONFIG_HOME/app-powerd/config.yaml`.
+pub fn user_config_path() -> PathBuf {
     let config_dir = std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -15,6 +18,22 @@ pub fn config_path() -> PathBuf {
             PathBuf::from(home).join(".config")
         });
     config_dir.join("app-powerd").join("config.yaml")
+}
+
+/// Get config file path.
+pub fn config_path() -> PathBuf {
+    resolve_config_path(&user_config_path(), Path::new(SYSTEM_CONFIG_PATH))
+}
+
+/// Pick between user config file and system config file.
+pub fn resolve_config_path(user: &Path, system: &Path) -> PathBuf {
+    if user.is_file() {
+        return user.to_path_buf();
+    }
+    if system.is_file() {
+        return system.to_path_buf();
+    }
+    user.to_path_buf()
 }
 
 /// Load and validate config from a path.
@@ -127,6 +146,14 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
             profile.cpu_weight,
             profile.cpu_quota.as_deref(),
         )?;
+    }
+
+    if let Some(psi) = config.defaults.memory.psi_some_avg10 {
+        if !(0.0..=100.0).contains(&psi) {
+            return Err(ConfigError::Validation {
+                message: format!("defaults.memory.psi_some_avg10 must be in 0..=100, got {psi}"),
+            });
+        }
     }
 
     // Validate numeric ranges in rule policies
@@ -450,6 +477,8 @@ mod tests {
                 nice: None,
                 cpu_weight: None,
                 cpu_quota: None,
+                memory_high: None,
+                memory_reclaim: None,
                 maintenance_resume: None,
                 guards: None,
             },
@@ -477,6 +506,8 @@ mod tests {
                 nice: None,
                 cpu_weight: None,
                 cpu_quota: None,
+                memory_high: None,
+                memory_reclaim: None,
                 maintenance_resume: None,
                 guards: None,
             },
@@ -531,5 +562,29 @@ mod tests {
         assert!(validate_throttle_params("ctx", None, None, Some("100%")).is_ok());
         // "101%" is above maximum
         assert!(validate_throttle_params("ctx", None, None, Some("101%")).is_err());
+    }
+
+    #[test]
+    fn resolve_config_path_prefers_user_then_system() {
+        let root = std::env::temp_dir().join(format!(
+            "app-powerd-cfg-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let user = root.join("user.yaml");
+        let system = root.join("system.yaml");
+        assert_eq!(resolve_config_path(&user, &system), user);
+
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&system, "version: 1\n").unwrap();
+        assert_eq!(resolve_config_path(&user, &system), system);
+
+        std::fs::write(&user, "version: 1\n").unwrap();
+        assert_eq!(resolve_config_path(&user, &system), user);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

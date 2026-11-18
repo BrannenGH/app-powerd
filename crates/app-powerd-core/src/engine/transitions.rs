@@ -59,11 +59,13 @@ impl Engine {
                 if let Some(entry) = self.registry.get_mut(app_id) {
                     entry.set_suspend_timer(handle);
                 }
+                self.apply_background_memory(app_id);
             }
             TransitionAction::CancelSuspendTimer => {
                 if let Some(entry) = self.registry.get_mut(app_id) {
                     entry.cancel_suspend_timer();
                 }
+                self.clear_background_memory(app_id);
             }
             TransitionAction::ApplyThrottle => {
                 let report = throttle::apply_throttle(
@@ -79,6 +81,7 @@ impl Engine {
                 }
                 self.suspend_failures.remove(app_id);
                 METRICS.apps_throttled_total.fetch_add(1, Ordering::Relaxed);
+                self.apply_background_memory(app_id);
             }
             TransitionAction::ApplyFreeze => {
                 if !self.freeze_with_journal(app_id, cgroup_path.clone(), procs) {
@@ -87,6 +90,7 @@ impl Engine {
                 if policy.maintenance_resume.enabled {
                     self.start_maintenance_timer(app_id);
                 }
+                self.apply_background_memory(app_id);
             }
             TransitionAction::RemoveThrottle | TransitionAction::Thaw => {
                 let elapsed_ms = self
@@ -100,6 +104,7 @@ impl Engine {
                     AppState::Throttled
                 };
                 self.restore_app_resources(app_id, current_state, cgroup_p, procs, elapsed_ms);
+                self.clear_background_memory(app_id);
             }
             TransitionAction::NoOp => {}
         }

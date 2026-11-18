@@ -13,6 +13,11 @@ impl Engine {
         // nothing. A timer can outlive the decision that scheduled it — the
         // policy may have changed on reload, or protection may have forced
         // `Ignore` after registration.
+        if entry.killing {
+            debug!(app_id = %app_id, "kill in progress, not suspending");
+            return;
+        }
+
         if entry.policy().action == Action::Ignore {
             debug!(app_id = %app_id, "policy is ignore, not suspending");
             if let Some(entry) = self.registry.get_mut(&app_id) {
@@ -188,7 +193,7 @@ impl Engine {
             let Some(entry) = self.registry.get(&app_id) else {
                 return;
             };
-            if entry.state() != AppState::Frozen {
+            if entry.state() != AppState::Frozen || entry.killing {
                 return;
             }
             entry.cgroup_path_buf()

@@ -1,6 +1,7 @@
 pub(crate) mod apply;
 pub(crate) mod cgroup;
 pub(crate) mod freeze;
+pub(crate) mod memory;
 /// Power source detection.
 pub mod power;
 /// Process identity and `/proc` inspection.

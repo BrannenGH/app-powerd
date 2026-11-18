@@ -42,6 +42,7 @@ impl Engine {
                     uptime_secs: self.start_time.elapsed().as_secs(),
                     cgroup_mode: caps.tier.to_string(),
                     cpu_control: caps.cpu_control,
+                    memory_control: caps.memory_control,
                     protected_apps,
                     protocol_version: crate::ipc::protocol::PROTOCOL_VERSION,
                 }

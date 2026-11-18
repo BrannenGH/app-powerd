@@ -33,6 +33,10 @@ pub struct Metrics {
     pub journal_stale_dropped_total: AtomicU64,
     /// Log messages withheld by the rate limiter.
     pub warns_suppressed_total: AtomicU64,
+    /// One-shot `memory.reclaim` writes that the kernel accepted.
+    pub memory_reclaims_total: AtomicU64,
+    /// Background applications SIGTERMed because memory pressure crossed the line.
+    pub apps_killed_total: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -60,6 +64,8 @@ impl Metrics {
             journal_recovered_total: AtomicU64::new(0),
             journal_stale_dropped_total: AtomicU64::new(0),
             warns_suppressed_total: AtomicU64::new(0),
+            memory_reclaims_total: AtomicU64::new(0),
+            apps_killed_total: AtomicU64::new(0),
         }
     }
 
@@ -81,6 +87,8 @@ impl Metrics {
             journal_recovered_total: self.journal_recovered_total.load(Ordering::Relaxed),
             journal_stale_dropped_total: self.journal_stale_dropped_total.load(Ordering::Relaxed),
             warns_suppressed_total: self.warns_suppressed_total.load(Ordering::Relaxed),
+            memory_reclaims_total: self.memory_reclaims_total.load(Ordering::Relaxed),
+            apps_killed_total: self.apps_killed_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -114,6 +122,10 @@ pub struct MetricsSnapshot {
     pub journal_stale_dropped_total: u64,
     #[serde(default)]
     pub warns_suppressed_total: u64,
+    #[serde(default)]
+    pub memory_reclaims_total: u64,
+    #[serde(default)]
+    pub apps_killed_total: u64,
 }
 
 /// Global metrics instance.
