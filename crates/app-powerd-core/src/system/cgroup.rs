@@ -1,6 +1,11 @@
+use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use super::cgroup_base_path;
@@ -47,11 +52,124 @@ pub struct CgroupCapabilities {
     pub cpu_control: bool,
 }
 
+/// The process's previous cgroup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Origin {
+    /// `starttime` of the process, so a recycled PID is not sent "home" to a
+    /// stranger's cgroup.
+    starttime: u64,
+    /// The app cgroup the process was moved into.
+    app_cgroup: PathBuf,
+    /// The cgroup it came from.
+    origin: PathBuf,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct OriginFile {
+    version: u32,
+    origins: HashMap<u32, Origin>,
+}
+
+const ORIGIN_FILE_VERSION: u32 = 1;
+
+#[derive(Debug, Default)]
+struct OriginStore {
+    /// Persistence target; `None` keeps the store in memory only (tests).
+    path: Option<PathBuf>,
+    by_pid: HashMap<u32, Origin>,
+}
+
+impl OriginStore {
+    fn load(path: PathBuf) -> Self {
+        let by_pid = match fs::read(&path) {
+            Ok(data) => match serde_json::from_slice::<OriginFile>(&data) {
+                Ok(file) if file.version == ORIGIN_FILE_VERSION => file.origins,
+                Ok(file) => {
+                    warn!(path = %path.display(), version = file.version, "ignoring cgroup origin file of unknown version");
+                    HashMap::new()
+                }
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "ignoring unreadable cgroup origin file");
+                    HashMap::new()
+                }
+            },
+            Err(_) => HashMap::new(),
+        };
+        Self {
+            path: Some(path),
+            by_pid,
+        }
+    }
+
+    fn persist(&self) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        if let Err(e) = self.write(path) {
+            warn!(path = %path.display(), error = %e, "failed to persist cgroup origins");
+        }
+    }
+
+    fn write(&self, path: &Path) -> std::io::Result<()> {
+        if self.by_pid.is_empty() {
+            return match fs::remove_file(path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            };
+        }
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        let file = OriginFile {
+            version: ORIGIN_FILE_VERSION,
+            origins: self.by_pid.clone(),
+        };
+        let json = serde_json::to_vec_pretty(&file)?;
+        let tmp = path.with_extension("json.tmp");
+        let mut handle = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        handle.write_all(&json)?;
+        handle.sync_all()?;
+        drop(handle);
+        fs::rename(&tmp, path)
+    }
+
+    /// Where the process should be returned to.
+    fn home_for(&self, pid: u32, starttime: Option<u64>, app_cgroup: &Path) -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+        if let Some(own) = self.by_pid.get(&pid) {
+            if Some(own.starttime) == starttime {
+                candidates.push(own.origin.clone());
+            }
+        }
+        for origin in self.by_pid.values() {
+            if origin.app_cgroup == app_cgroup && !candidates.contains(&origin.origin) {
+                candidates.push(origin.origin.clone());
+            }
+        }
+        candidates
+    }
+}
+
+/// Result of returning an app to where they came from.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct EvacuationReport {
+    /// Processes moved back to their original cgroup.
+    pub returned: usize,
+    /// Processes that are still in the app cgroup.
+    pub stuck: usize,
+}
+
 /// Manages cgroup v2 operations.
 pub struct CgroupManager {
     capabilities: CgroupCapabilities,
     base_path: PathBuf,
     systemd: Option<SystemdManager>,
+    origins: Mutex<OriginStore>,
 }
 
 impl Default for CgroupManager {
@@ -98,6 +216,7 @@ impl CgroupManager {
                     capabilities,
                     base_path,
                     systemd: None,
+                    origins: Mutex::default(),
                 };
             }
         }
@@ -112,6 +231,7 @@ impl CgroupManager {
                 },
                 base_path,
                 systemd: Some(mgr),
+                origins: Mutex::default(),
             };
         }
 
@@ -123,7 +243,28 @@ impl CgroupManager {
             },
             base_path,
             systemd: None,
+            origins: Mutex::default(),
         }
+    }
+
+    /// Persist the original cgroup of every moved process to `path`, loading
+    /// what a previous run recorded there.
+    pub fn persist_origins_at(&self, path: PathBuf) {
+        *self.lock_origins() = OriginStore::load(path);
+    }
+
+    fn lock_origins(&self) -> std::sync::MutexGuard<'_, OriginStore> {
+        self.origins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn is_app_cgroup(&self, path: &Path) -> bool {
+        path.parent() == Some(self.base_path.as_path())
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("app-powerd-"))
     }
 
     /// Report the detected capabilities exactly once, at startup.
@@ -195,14 +336,78 @@ impl CgroupManager {
 
     /// Move a PID into a cgroup.
     pub fn move_pid(&self, cgroup_path: &Path, pid: u32) -> Result<(), SystemError> {
-        let procs_file = cgroup_path.join("cgroup.procs");
-        fs::write(&procs_file, pid.to_string()).map_err(|e| SystemError::CgroupOperation {
-            operation: format!("move_pid({pid})"),
-            path: procs_file.display().to_string(),
-            source: e,
-        })?;
+        let record = if self.capabilities.tier == CgroupCapability::DirectWrite {
+            match (super::ProcessHandle::open(pid), process_cgroup(pid)) {
+                (_, Some(current)) if current == cgroup_path => return Ok(()),
+                (Some(handle), Some(current)) if !self.is_app_cgroup(&current) => Some(Origin {
+                    starttime: handle.starttime,
+                    app_cgroup: cgroup_path.to_path_buf(),
+                    origin: current,
+                }),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        write_procs(cgroup_path, pid, "move_pid")?;
         debug!(pid, cgroup = %cgroup_path.display(), "moved pid to cgroup");
+
+        if let Some(origin) = record {
+            let mut store = self.lock_origins();
+            store.by_pid.insert(pid, origin);
+            store.persist();
+        }
         Ok(())
+    }
+
+    /// Return every process in an app cgroup to the cgroup it came from.
+    pub fn evacuate(&self, cgroup_path: &Path) -> EvacuationReport {
+        let mut report = EvacuationReport::default();
+        if self.capabilities.tier != CgroupCapability::DirectWrite {
+            return report;
+        }
+
+        let mut store = self.lock_origins();
+        for pid in cgroup_pids(cgroup_path) {
+            let starttime = super::ProcessHandle::open(pid).map(|h| h.starttime);
+            let homes = store.home_for(pid, starttime, cgroup_path);
+            let returned = homes.iter().filter(|home| home.is_dir()).any(|home| {
+                match write_procs(home, pid, "return_pid") {
+                    Ok(()) => {
+                        debug!(pid, cgroup = %home.display(), "returned pid to its original cgroup");
+                        true
+                    }
+                    Err(e) => {
+                        debug!(pid, cgroup = %home.display(), error = %e, "could not return pid");
+                        false
+                    }
+                }
+            });
+            if returned {
+                report.returned += 1;
+                store.by_pid.remove(&pid);
+            } else {
+                report.stuck += 1;
+            }
+        }
+
+        /// Filter out dead processes
+        let still_here: Vec<u32> = cgroup_pids(cgroup_path);
+        store
+            .by_pid
+            .retain(|pid, origin| origin.app_cgroup != cgroup_path || still_here.contains(pid));
+        store.persist();
+
+        if report.stuck > 0 {
+            warn!(
+                cgroup = %cgroup_path.display(),
+                returned = report.returned,
+                stuck = report.stuck,
+                "some processes could not be returned to their original cgroup"
+            );
+        }
+        report
     }
 
     /// Freeze a cgroup (cgroup v2 freezer).
@@ -301,8 +506,11 @@ impl CgroupManager {
             };
             if name_str.starts_with("app-powerd-") {
                 let path = entry.path();
-                // Try thaw before removing (frozen cgroup can't be removed)
                 let _ = fs::write(path.join("cgroup.freeze"), "0");
+                let report = self.evacuate(&path);
+                if report.returned > 0 {
+                    info!(path = %path.display(), returned = report.returned, "returned processes left by a previous run");
+                }
                 match fs::remove_dir(&path) {
                     Ok(()) => info!(path = %path.display(), "cleaned up stale cgroup"),
                     Err(e) => {
@@ -326,6 +534,38 @@ impl CgroupManager {
     }
 }
 
+fn write_procs(cgroup_path: &Path, pid: u32, operation: &str) -> Result<(), SystemError> {
+    let procs_file = cgroup_path.join("cgroup.procs");
+    fs::write(&procs_file, pid.to_string()).map_err(|e| SystemError::CgroupOperation {
+        operation: format!("{operation}({pid})"),
+        path: procs_file.display().to_string(),
+        source: e,
+    })
+}
+
+fn cgroup_pids(cgroup_path: &Path) -> Vec<u32> {
+    fs::read_to_string(cgroup_path.join("cgroup.procs"))
+        .map(|content| {
+            content
+                .lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn process_cgroup(pid: u32) -> Option<PathBuf> {
+    let content = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    parse_cgroup_v2_path(&content)
+}
+
+fn parse_cgroup_v2_path(content: &str) -> Option<PathBuf> {
+    content
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .map(|path| PathBuf::from("/sys/fs/cgroup").join(path.trim().trim_start_matches('/')))
+}
+
 /// Whether `controller` is enabled for children of `path`.
 ///
 /// A controller listed in a cgroup's `cgroup.subtree_control` is the only thing
@@ -335,4 +575,82 @@ fn controller_enabled(path: &Path, controller: &str) -> bool {
     fs::read_to_string(path.join("cgroup.subtree_control"))
         .map(|content| content.split_whitespace().any(|c| c == controller))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_unified_cgroup_line() {
+        let content = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/plasma-plasmashell.service\n";
+        assert_eq!(
+            parse_cgroup_v2_path(content),
+            Some(PathBuf::from(
+                "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/plasma-plasmashell.service"
+            ))
+        );
+        assert_eq!(parse_cgroup_v2_path("1:name=systemd:/foo\n"), None);
+    }
+
+    fn origin(starttime: u64, app: &str, home: &str) -> Origin {
+        Origin {
+            starttime,
+            app_cgroup: PathBuf::from(app),
+            origin: PathBuf::from(home),
+        }
+    }
+
+    #[test]
+    fn home_prefers_own_record_then_siblings() {
+        let mut store = OriginStore::default();
+        store
+            .by_pid
+            .insert(10, origin(5, "/cg/app-powerd-a", "/cg/own.scope"));
+        store
+            .by_pid
+            .insert(11, origin(6, "/cg/app-powerd-a", "/cg/parent.scope"));
+        store
+            .by_pid
+            .insert(12, origin(7, "/cg/app-powerd-b", "/cg/other.scope"));
+
+        let homes = store.home_for(10, Some(5), Path::new("/cg/app-powerd-a"));
+        assert_eq!(homes.first(), Some(&PathBuf::from("/cg/own.scope")));
+        assert!(!homes.contains(&PathBuf::from("/cg/other.scope")));
+
+        let homes = store.home_for(99, Some(1), Path::new("/cg/app-powerd-a"));
+        assert_eq!(homes.len(), 2);
+    }
+
+    #[test]
+    fn recycled_pid_does_not_use_stale_record() {
+        let mut store = OriginStore::default();
+        store
+            .by_pid
+            .insert(10, origin(5, "/cg/app-powerd-a", "/cg/own.scope"));
+        let homes = store.home_for(10, Some(42), Path::new("/cg/app-powerd-z"));
+        assert!(homes.is_empty());
+    }
+
+    #[test]
+    fn origin_file_round_trips() {
+        let dir = std::env::temp_dir().join(format!("app-powerd-origins-{}", std::process::id()));
+        let path = dir.join("cgroup-origins.json");
+        let mut store = OriginStore {
+            path: Some(path.clone()),
+            by_pid: HashMap::new(),
+        };
+        store
+            .by_pid
+            .insert(10, origin(5, "/cg/app-powerd-a", "/cg/own.scope"));
+        store.persist();
+
+        let loaded = OriginStore::load(path.clone());
+        assert_eq!(loaded.by_pid, store.by_pid);
+
+        store.by_pid.clear();
+        store.persist();
+        assert!(!path.exists(), "an empty store removes its file");
+        let _ = fs::remove_dir_all(dir);
+    }
 }

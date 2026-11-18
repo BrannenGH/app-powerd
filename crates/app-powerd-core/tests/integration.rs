@@ -1744,3 +1744,189 @@ async fn thaw_all_releases_processes_of_retired_apps() {
     engine_handle.await.unwrap();
     let _ = std::fs::remove_dir_all(journal_path.parent().unwrap());
 }
+
+fn cgroup_of(pid: u32) -> String {
+    std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .unwrap_or_default()
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+#[tokio::test]
+async fn shutdown_returns_processes_to_their_original_cgroup() {
+    let journal_path = temp_journal("cgroup-return");
+    let journal = app_powerd_core::state::FreezeJournal::load(journal_path.clone()).unwrap();
+    let (engine, tx) = Engine::with_journal(
+        reactive_config(""),
+        std::path::PathBuf::from("/tmp/test-config.yaml"),
+        journal,
+    )
+    .expect("engine init");
+    let engine_handle = tokio::spawn(engine.run());
+
+    if query_status(&tx).await.cgroup_mode != "DirectWrite" {
+        eprintln!("skipping: DirectWrite cgroup mode not available here");
+        tx.send(EngineEvent::Shutdown).await.unwrap();
+        engine_handle.await.unwrap();
+        return;
+    }
+
+    let target = TestProc::spawn();
+    let pid = target.pid();
+    let original = cgroup_of(pid);
+
+    tx.send(EngineEvent::FocusChanged(make_window(
+        1,
+        pid,
+        "CgroupReturn",
+    )))
+    .await
+    .unwrap();
+    wait_until(
+        || cgroup_of(pid) != original,
+        "target to be moved into its app cgroup",
+    )
+    .await;
+    let origins = journal_path.with_file_name("cgroup-origins.json");
+    assert!(
+        origins.exists(),
+        "the original cgroup must be recorded on disk"
+    );
+
+    tx.send(EngineEvent::Shutdown).await.unwrap();
+    engine_handle.await.unwrap();
+
+    assert!(
+        app_powerd_core::system::ProcessHandle::open(pid).is_some_and(|h| h.is_alive()),
+        "the managed process must survive shutdown"
+    );
+    assert_eq!(
+        cgroup_of(pid),
+        original,
+        "shutdown must return the process home"
+    );
+    assert!(
+        !origins.exists(),
+        "nothing is left to return after a clean shutdown"
+    );
+    let _ = std::fs::remove_dir_all(journal_path.parent().unwrap());
+}
+
+#[tokio::test]
+async fn restart_returns_processes_left_by_a_previous_run() {
+    let journal_path = temp_journal("cgroup-crash");
+    let journal = app_powerd_core::state::FreezeJournal::load(journal_path.clone()).unwrap();
+    let (engine, tx) = Engine::with_journal(
+        reactive_config(""),
+        std::path::PathBuf::from("/tmp/test-config.yaml"),
+        journal,
+    )
+    .expect("engine init");
+    let engine_handle = tokio::spawn(engine.run());
+
+    if query_status(&tx).await.cgroup_mode != "DirectWrite" {
+        eprintln!("skipping: DirectWrite cgroup mode not available here");
+        tx.send(EngineEvent::Shutdown).await.unwrap();
+        engine_handle.await.unwrap();
+        return;
+    }
+
+    let target = TestProc::spawn();
+    let pid = target.pid();
+    let original = cgroup_of(pid);
+
+    tx.send(EngineEvent::FocusChanged(make_window(
+        1,
+        pid,
+        "CgroupCrash",
+    )))
+    .await
+    .unwrap();
+    wait_until(
+        || cgroup_of(pid) != original,
+        "target to be moved into its app cgroup",
+    )
+    .await;
+
+    engine_handle.abort();
+    let _ = engine_handle.await;
+    assert_ne!(
+        cgroup_of(pid),
+        original,
+        "precondition: still in the app cgroup"
+    );
+
+    let journal = app_powerd_core::state::FreezeJournal::load(journal_path.clone()).unwrap();
+    let (engine, tx) = Engine::with_journal(
+        reactive_config(""),
+        std::path::PathBuf::from("/tmp/test-config.yaml"),
+        journal,
+    )
+    .expect("engine re-init");
+    assert_eq!(
+        cgroup_of(pid),
+        original,
+        "startup must return processes left behind"
+    );
+
+    let engine_handle = tokio::spawn(engine.run());
+    tx.send(EngineEvent::Shutdown).await.unwrap();
+    engine_handle.await.unwrap();
+    let _ = std::fs::remove_dir_all(journal_path.parent().unwrap());
+}
+
+#[tokio::test]
+async fn reload_to_ignore_returns_process_to_its_original_cgroup() {
+    let (engine, tx) = Engine::new(
+        reactive_config(""),
+        std::path::PathBuf::from("/tmp/test-config.yaml"),
+    )
+    .expect("engine init");
+    let engine_handle = tokio::spawn(engine.run());
+
+    if query_status(&tx).await.cgroup_mode != "DirectWrite" {
+        eprintln!("skipping: DirectWrite cgroup mode not available here");
+        tx.send(EngineEvent::Shutdown).await.unwrap();
+        engine_handle.await.unwrap();
+        return;
+    }
+
+    let target = TestProc::spawn();
+    let pid = target.pid();
+    let original = cgroup_of(pid);
+    tx.send(EngineEvent::FocusChanged(make_window(
+        1,
+        pid,
+        "ReloadIgnore",
+    )))
+    .await
+    .unwrap();
+    wait_until(
+        || cgroup_of(pid) != original,
+        "target to be moved into its app cgroup",
+    )
+    .await;
+
+    let ignore = reactive_config(
+        r#"
+rules:
+  - id: ignore-target
+    match:
+      wm_class: [ReloadIgnore]
+    policy:
+      action: ignore
+"#,
+    );
+    tx.send(EngineEvent::ConfigReloaded(ignore)).await.unwrap();
+    wait_until(
+        || cgroup_of(pid) == original,
+        "ignored app to be returned home",
+    )
+    .await;
+
+    tx.send(EngineEvent::Shutdown).await.unwrap();
+    engine_handle.await.unwrap();
+}

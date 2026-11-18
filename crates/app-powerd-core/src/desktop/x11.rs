@@ -139,7 +139,7 @@ impl X11Backend {
                 let pid = u32::from_ne_bytes(reply.value[..4].try_into().unwrap_or([0; 4]));
                 if pid > 0 {
                     info.pid = Some(pid);
-                    info.executable = process::exe_name(pid).ok();
+                    info.executable = process::process_name(pid);
                     info.cmdline = process::cmdline(pid).ok();
                 }
             }

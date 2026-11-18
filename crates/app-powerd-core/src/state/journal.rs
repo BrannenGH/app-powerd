@@ -140,6 +140,10 @@ impl FreezeJournal {
         }
     }
 
+    pub fn path(&self) -> Option<&Path> {
+        (!self.is_disabled()).then_some(self.path.as_path())
+    }
+
     fn is_disabled(&self) -> bool {
         self.path.as_os_str().is_empty()
     }

@@ -200,6 +200,9 @@ impl Engine {
 
         let cgroup_mgr = CgroupManager::new();
         cgroup_mgr.report_capabilities(&config.profiles_requiring_cpu_control());
+        if let Some(dir) = journal.path().and_then(std::path::Path::parent) {
+            cgroup_mgr.persist_origins_at(dir.join("cgroup-origins.json"));
+        }
         cgroup_mgr.cleanup_stale_cgroups();
 
         let engine = Self {

@@ -102,6 +102,42 @@ pub(crate) fn exe_name(pid: u32) -> Result<String, SystemError> {
         .unwrap_or_else(|| link.to_string_lossy().to_string()))
 }
 
+const DELETED_SUFFIX: &str = " (deleted)";
+
+/// Best executable basename for `pid`, for rule matching.
+pub(crate) fn process_name(pid: u32) -> Option<String> {
+    if let Ok(name) = exe_name(pid) {
+        let name = strip_deleted(&name);
+        if !name.is_empty() {
+            return Some(name.to_string());
+        }
+    }
+    if let Some(name) = cmdline_argv0(pid) {
+        return Some(name);
+    }
+    comm(pid)
+}
+
+fn strip_deleted(name: &str) -> &str {
+    name.strip_suffix(DELETED_SUFFIX).unwrap_or(name)
+}
+
+fn cmdline_argv0(pid: u32) -> Option<String> {
+    let data = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    argv0_basename(&data)
+}
+
+fn argv0_basename(cmdline: &[u8]) -> Option<String> {
+    let argv0 = cmdline.split(|&b| b == 0).next()?;
+    let argv0 = String::from_utf8_lossy(argv0);
+    // Some programs rewrite argv[0] to a status line ("sshd: user@pts/0");
+    // only the leading word can be an executable path.
+    let first = argv0.split_whitespace().next()?;
+    let base = first.rsplit('/').next().unwrap_or(first);
+    let base = base.trim_end_matches(':');
+    (!base.is_empty()).then(|| base.to_string())
+}
+
 /// Read `/proc/PID/comm` — the kernel's short process name.
 ///
 /// Used as a fallback identity when `/proc/<pid>/exe` is unreadable, which is
@@ -319,6 +355,31 @@ mod tests {
     #[test]
     fn comm_of_self_is_non_empty() {
         assert!(comm(std::process::id()).is_some());
+    }
+
+    #[test]
+    fn strip_deleted_suffix_from_replaced_binary() {
+        assert_eq!(strip_deleted("plasmashell (deleted)"), "plasmashell");
+        assert_eq!(strip_deleted("plasmashell"), "plasmashell");
+    }
+
+    #[test]
+    fn argv0_basename_handles_paths_and_status_lines() {
+        assert_eq!(
+            argv0_basename(b"/usr/bin/plasmashell\0--no-respawn\0").as_deref(),
+            Some("plasmashell")
+        );
+        assert_eq!(argv0_basename(b"konsole\0").as_deref(), Some("konsole"));
+        assert_eq!(
+            argv0_basename(b"sshd: admin@pts/0\0").as_deref(),
+            Some("sshd")
+        );
+        assert_eq!(argv0_basename(b"").as_deref(), None);
+    }
+
+    #[test]
+    fn process_name_of_self_is_known() {
+        assert!(process_name(std::process::id()).is_some());
     }
 
     #[test]

@@ -148,6 +148,7 @@ impl Engine {
             .get(app_id)
             .and_then(|entry| entry.cgroup_path_buf());
         if let Some(path) = cgroup {
+            self.cgroup_mgr.evacuate(&path);
             if let Err(e) = self.cgroup_mgr.remove_cgroup(&path) {
                 debug!(app_id = %app_id, error = %e, "failed to remove cgroup for defunct app");
             }

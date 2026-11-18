@@ -77,6 +77,7 @@ impl Engine {
             }
         }
         let mut policy = self.rules_engine.match_window(&ctx);
+        self.warn_if_executable_unknown(&app_id, &window);
 
         // Protection is applied here, at policy resolution, rather than at the
         // moment of freezing. An application forced to `Ignore` never gets a
@@ -110,6 +111,30 @@ impl Engine {
         self.registry.insert(entry);
 
         self.setup_cgroup(&app_id);
+    }
+
+    /// Warn, once per application, when the window reached us without an
+    /// executable name.
+    fn warn_if_executable_unknown(&mut self, app_id: &AppId, window: &WindowInfo) {
+        if window.executable.as_deref().is_some_and(|e| !e.is_empty()) {
+            return;
+        }
+        let rules = self.rules_engine.executable_only_rules();
+        if rules.is_empty() {
+            return;
+        }
+        if self
+            .rate_limiter
+            .allow(LogKey::app(app_id.as_str(), "no-executable"))
+        {
+            warn!(
+                app_id = %app_id,
+                rules = %rules.join(", "),
+                "the desktop backend supplied no executable for this window; \
+                 these executable-only rules cannot match it. \
+                 Add app_id or wm_class criteria to them."
+            );
+        }
     }
 
     /// Whether this window's process must never be suspended.
@@ -232,6 +257,7 @@ impl Engine {
         );
 
         if let Some(path) = cgroup_path.as_deref() {
+            self.cgroup_mgr.evacuate(path);
             if let Err(e) = self.cgroup_mgr.remove_cgroup(path) {
                 debug!(app_id = %app_id, error = %e, "failed to remove cgroup on window close");
             }
