@@ -51,6 +51,13 @@ pub(crate) const BUILTIN_DENY: &[&str] = &[
     "polkit-*",
     "elogind",
     "systemd*",
+    "plasmashell",
+    "kwin_*",
+    "ksmserver",
+    "kded*",
+    "kglobalacceld",
+    "gnome-shell",
+    "Xwayland",
     // Modal dialogs: they consume no CPU by definition, but whoever spawned them
     // is blocked until the user answers.
     "zenity",
@@ -272,6 +279,23 @@ mod tests {
         assert!(matches_deny_list("PINENTRY-curses").is_some());
         assert!(matches_deny_list("polkit-gnome-authentication-agent-1").is_some());
         assert!(matches_deny_list("systemd-userdbd").is_some());
+    }
+
+    #[test]
+    fn desktop_shells_are_protected() {
+        for shell in [
+            "plasmashell",
+            "kwin_wayland",
+            "kwin_x11",
+            "gnome-shell",
+            "Xwayland",
+        ] {
+            assert!(
+                matches_deny_list(shell).is_some(),
+                "{shell} must be protected"
+            );
+        }
+        assert!(matches_deny_list("konsole").is_none());
     }
 
     /// Guix installs wrapped binaries as `.name-real`; the deny list must still

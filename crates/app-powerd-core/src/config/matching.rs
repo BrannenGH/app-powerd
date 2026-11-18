@@ -80,6 +80,22 @@ impl RulesEngine {
     pub fn config(&self) -> &Config {
         &self.config
     }
+
+    /// IDs of rules that can only match on the executable name.
+    pub fn executable_only_rules(&self) -> Vec<&str> {
+        self.compiled
+            .iter()
+            .filter(|r| {
+                !r.executables.is_empty()
+                    && r.wm_classes.is_empty()
+                    && r.app_ids.is_empty()
+                    && r.desktop_files.is_empty()
+                    && r.cmdline_regex.is_none()
+                    && r.window_title_regex.is_none()
+            })
+            .map(|r| r.id.as_str())
+            .collect()
+    }
 }
 
 fn compile_optional_regex(

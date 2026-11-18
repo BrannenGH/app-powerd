@@ -1,11 +1,11 @@
 [Unit]
 Description=App Power Daemon - Background App Power Management
-Documentation=https://github.com/user/app-powerd
+Documentation=https://github.com/BrannenGH/app-powerd
 After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/.cargo/bin/app-powerd run
+ExecStart=/usr/bin/app-powerd run
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
@@ -15,6 +15,9 @@ RestartSec=5
 # killed part-way leaves them stranded. Give it room to finish.
 TimeoutStopSec=30
 KillSignal=SIGTERM
+
+KillMode=process
+Delegate=yes
 
 # The freeze journal lives in $XDG_RUNTIME_DIR/app-powerd/, covered by
 # ReadWritePaths=%t below. It records what is suspended so a crashed daemon's
@@ -29,10 +32,6 @@ ProtectHome=read-only
 ReadWritePaths=%t
 PrivateTmp=true
 NoNewPrivileges=true
-
-# Resource limits
-MemoryMax=50M
-CPUQuota=5%
 
 [Install]
 WantedBy=graphical-session.target

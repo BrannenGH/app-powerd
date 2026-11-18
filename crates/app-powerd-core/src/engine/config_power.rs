@@ -113,6 +113,28 @@ impl Engine {
                 // Everything else — no-op
                 _ => {}
             }
+
+            if new_action == Action::Ignore {
+                // An ignored app is moved outside of the cgroup.
+                self.release_cgroup(&app_id);
+            } else if old_action == Action::Ignore {
+                self.setup_cgroup(&app_id);
+            }
+        }
+    }
+
+    /// Return an app's processes to their original cgroup.
+    pub(crate) fn release_cgroup(&mut self, app_id: &AppId) {
+        let Some(path) = self
+            .registry
+            .get_mut(app_id)
+            .and_then(|entry| entry.take_cgroup_path())
+        else {
+            return;
+        };
+        self.cgroup_mgr.evacuate(&path);
+        if let Err(e) = self.cgroup_mgr.remove_cgroup(&path) {
+            debug!(app_id = %app_id, error = %e, "failed to remove released cgroup");
         }
     }
 
@@ -154,12 +176,8 @@ impl Engine {
             return false;
         }
 
-        let config = self.rules_engine.config();
-        match self.effective_power_source() {
-            PowerSource::Ac => config.defaults.mode.ac == PowerMode::Enable,
-            PowerSource::Battery => config.defaults.mode.battery == PowerMode::Enable,
-            PowerSource::Unknown => true,
-        }
+        let mode = &self.rules_engine.config().defaults.mode;
+        mode_for(self.effective_power_source(), mode.ac, mode.battery) == PowerMode::Enable
     }
 
     pub(crate) fn thaw_all(&mut self) {
@@ -183,10 +201,12 @@ impl Engine {
         info!("graceful shutdown: thawing all apps");
         self.thaw_all();
 
-        // Cancel all timers and clean up cgroups
+        // Cancel all timers and hand every process back to the cgroup it came
+        // from.
         for (_, entry) in self.registry.iter_mut() {
             entry.cancel_all_timers();
             if let Some(path) = entry.cgroup_path_ref() {
+                self.cgroup_mgr.evacuate(path);
                 if let Err(e) = self.cgroup_mgr.remove_cgroup(path) {
                     debug!(error = %e, "failed to remove cgroup during shutdown");
                 }
@@ -227,5 +247,40 @@ impl Engine {
         } else {
             info!(released, "shutdown: released remaining processes");
         }
+    }
+}
+
+/// The configured power mode.
+pub(crate) fn mode_for(source: PowerSource, ac: PowerMode, battery: PowerMode) -> PowerMode {
+    match source {
+        PowerSource::Battery => battery,
+        PowerSource::Ac | PowerSource::Unknown => ac,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_power_source_follows_ac_mode() {
+        let (ac, battery) = (PowerMode::Disable, PowerMode::Enable);
+        assert_eq!(
+            mode_for(PowerSource::Unknown, ac, battery),
+            PowerMode::Disable
+        );
+        assert_eq!(mode_for(PowerSource::Ac, ac, battery), PowerMode::Disable);
+        assert_eq!(
+            mode_for(PowerSource::Battery, ac, battery),
+            PowerMode::Enable
+        );
+    }
+
+    #[test]
+    fn unknown_power_source_manages_when_ac_is_enabled() {
+        assert_eq!(
+            mode_for(PowerSource::Unknown, PowerMode::Enable, PowerMode::Disable),
+            PowerMode::Enable
+        );
     }
 }

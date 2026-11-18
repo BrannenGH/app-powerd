@@ -19,6 +19,8 @@ use tracing::{debug, warn};
 use crate::desktop::window::WindowInfo;
 use crate::desktop::{FocusBackend, FocusEvent};
 use crate::error::DesktopError;
+use crate::system::process::{self, CachedProcessInfo};
+use crate::system::ProcessHandle;
 
 const KWIN_BUS: &str = "org.kde.KWin";
 const KWIN_SCRIPTING_PATH: &str = "/Scripting";
@@ -55,7 +57,8 @@ struct KdeWindow {
 struct EventMapper {
     window_ids: HashMap<String, u64>,
     next_window_id: u64,
-    pid_cache: HashMap<u32, crate::system::process::CachedProcessInfo>,
+    /// Keyed by `(pid, starttime)` to handle recycled PIDs.
+    pid_cache: HashMap<ProcessHandle, CachedProcessInfo>,
 }
 
 impl EventMapper {
@@ -97,7 +100,7 @@ impl KdeWindow {
     fn to_info(
         &self,
         window_id: u64,
-        pid_cache: &mut HashMap<u32, crate::system::process::CachedProcessInfo>,
+        pid_cache: &mut HashMap<ProcessHandle, CachedProcessInfo>,
     ) -> WindowInfo {
         let mut info = WindowInfo::new(window_id);
         info.title = Some(self.title.clone());
@@ -112,17 +115,35 @@ impl KdeWindow {
         if self.pid > 0 {
             let pid = self.pid as u32;
             info.pid = Some(pid);
-            let cached = pid_cache.entry(pid).or_insert_with(|| {
-                let exe = crate::system::process::exe_name(pid).unwrap_or_default();
-                let cmdline = crate::system::process::cmdline(pid).ok();
-                crate::system::process::CachedProcessInfo { exe, cmdline }
-            });
-            info.executable = Some(cached.exe.clone());
-            info.cmdline = cached.cmdline.clone();
+            if let Some(cached) = lookup_process(pid, pid_cache) {
+                info.executable = Some(cached.exe.clone());
+                info.cmdline = cached.cmdline.clone();
+            } else {
+                debug!(
+                    pid,
+                    "KDE: could not identify the executable of a focused window; \
+                     match.executable rules will not apply to it"
+                );
+            }
         }
 
         info
     }
+}
+
+/// Executable and command line of `pid`, cached per process identity.
+fn lookup_process(
+    pid: u32,
+    pid_cache: &mut HashMap<ProcessHandle, CachedProcessInfo>,
+) -> Option<&CachedProcessInfo> {
+    let handle = ProcessHandle::open(pid)?;
+    if !pid_cache.contains_key(&handle) {
+        let exe = process::process_name(pid)?;
+        let cmdline = process::cmdline(pid).ok();
+        pid_cache.retain(|cached, _| cached.pid != pid);
+        pid_cache.insert(handle, CachedProcessInfo { exe, cmdline });
+    }
+    pid_cache.get(&handle)
 }
 
 struct KdeEventSink {
@@ -327,6 +348,21 @@ mod tests {
         let closed = FOCUSED.replace("\"focused\"", "\"closed\"");
 
         assert!(mapper.map(&closed).unwrap().is_none());
+    }
+
+    #[test]
+    fn focused_window_with_pid_carries_executable() {
+        let mut mapper = EventMapper::new();
+        let pid = std::process::id();
+        let focused = FOCUSED.replace("\"pid\":0", &format!("\"pid\":{pid}"));
+
+        let Some(FocusEvent::FocusChanged(window)) = mapper.map(&focused).unwrap() else {
+            panic!("expected focus event");
+        };
+        assert_eq!(window.pid, Some(pid));
+        let expected = process::process_name(pid).expect("own process is identifiable");
+        assert_eq!(window.executable.as_deref(), Some(expected.as_str()));
+        assert!(!expected.is_empty());
     }
 
     #[test]

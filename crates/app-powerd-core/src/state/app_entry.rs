@@ -220,6 +220,10 @@ impl AppEntry {
         self.cgroup_path = Some(path);
     }
 
+    pub fn take_cgroup_path(&mut self) -> Option<std::path::PathBuf> {
+        self.cgroup_path.take()
+    }
+
     pub fn set_policy(&mut self, policy: ResolvedPolicy) {
         self.policy = policy;
     }

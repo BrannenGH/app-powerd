@@ -12,6 +12,12 @@ pub enum ConfigError {
     #[error("parse error: {0}")]
     Parse(#[from] serde_yaml_ng::Error),
 
+    #[error("parse error: {source}\n  hint: {hint}")]
+    ParseHint {
+        source: serde_yaml_ng::Error,
+        hint: String,
+    },
+
     /// Semantic validation error (e.g. invalid field values).
     #[error("validation error: {message}")]
     Validation { message: String },

@@ -181,11 +181,11 @@ fn window_state_to_info(
     if state.pid > 0 {
         info.pid = Some(state.pid);
         let cached = pid_cache.entry(state.pid).or_insert_with(|| {
-            let exe = crate::system::process::exe_name(state.pid).unwrap_or_default();
+            let exe = crate::system::process::process_name(state.pid).unwrap_or_default();
             let cmdline = crate::system::process::cmdline(state.pid).ok();
             crate::system::process::CachedProcessInfo { exe, cmdline }
         });
-        info.executable = Some(cached.exe.clone());
+        info.executable = Some(cached.exe.clone()).filter(|exe| !exe.is_empty());
         info.cmdline = cached.cmdline.clone();
     }
     info

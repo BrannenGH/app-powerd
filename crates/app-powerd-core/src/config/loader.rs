@@ -26,11 +26,45 @@ pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
     }
 
     let content = std::fs::read_to_string(path)?;
-    let config: Config = serde_yaml_ng::from_str(&content)?;
+    let config: Config = serde_yaml_ng::from_str(&content).map_err(with_hint)?;
     validate(&config)?;
 
     info!(path = %path.display(), "config loaded");
     Ok(config)
+}
+
+/// YAML Rule.
+const RULE_SHAPE: &str =
+    "each rule is a mapping with exactly the keys `id`, `match` and `policy`, e.g.\n\
+  - id: shell\n\
+    match:\n\
+      app_id: [plasmashell]\n\
+    policy:\n\
+      use_profile: ignore";
+
+/// Attach a hint to the YAML error.
+fn with_hint(error: serde_yaml_ng::Error) -> ConfigError {
+    let message = error.to_string();
+    let hint = if message.starts_with("rules") {
+        if message.contains("expected field identifier") {
+            Some(format!(
+                "a mapping was found where a key name was expected; {RULE_SHAPE}"
+            ))
+        } else if message.contains("PolicyConfig") || message.contains("unknown field") {
+            Some(RULE_SHAPE.to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    match hint {
+        Some(hint) => ConfigError::ParseHint {
+            source: error,
+            hint,
+        },
+        None => ConfigError::Parse(error),
+    }
 }
 
 /// Load config or return defaults if file doesn't exist.
@@ -157,6 +191,56 @@ impl Default for Config {
     }
 }
 
+/// How long to wait from the config file is saved to reloaded.
+const RELOAD_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Mask for the config directory itself
+fn dir_mask() -> WatchMask {
+    WatchMask::CLOSE_WRITE | WatchMask::MOVED_TO | WatchMask::DELETE_SELF | WatchMask::MOVE_SELF
+}
+
+/// Mask for an ancestor while the config directory does not exist yet.
+fn ancestor_mask() -> WatchMask {
+    WatchMask::CREATE | WatchMask::MOVED_TO | WatchMask::DELETE_SELF | WatchMask::MOVE_SELF
+}
+
+/// What the watcher currently has its inotify watch on.
+struct Armed {
+    wd: inotify::WatchDescriptor,
+    /// Whether the watch is on the config directory itself
+    on_config_dir: bool,
+}
+
+/// Watch the config directory.
+fn arm(watches: &mut inotify::Watches, dir: &Path) -> std::io::Result<Armed> {
+    if dir.is_dir() {
+        let wd = watches.add(dir, dir_mask())?;
+        return Ok(Armed {
+            wd,
+            on_config_dir: true,
+        });
+    }
+    let ancestor = dir
+        .ancestors()
+        .skip(1)
+        .find(|a| a.is_dir())
+        .unwrap_or(Path::new("/"));
+    info!(
+        dir = %dir.display(),
+        watching = %ancestor.display(),
+        "config directory does not exist yet; will start watching it once it is created"
+    );
+    let wd = watches.add(ancestor, ancestor_mask())?;
+    if dir.is_dir() {
+        let _ = watches.remove(wd);
+        return arm(watches, dir);
+    }
+    Ok(Armed {
+        wd,
+        on_config_dir: false,
+    })
+}
+
 /// Watch config file for changes using inotify. Returns an async stream.
 pub async fn watch_config(path: &Path) -> Result<tokio::sync::mpsc::Receiver<()>, ConfigError> {
     let (tx, rx) = tokio::sync::mpsc::channel(4);
@@ -174,26 +258,75 @@ pub async fn watch_config(path: &Path) -> Result<tokio::sync::mpsc::Receiver<()>
             message: "config path has no filename".into(),
         })?
         .to_os_string();
+    let config_file = path.to_path_buf();
 
     let inotify = Inotify::init()?;
-    inotify.watches().add(
-        &dir,
-        WatchMask::MODIFY | WatchMask::CREATE | WatchMask::MOVED_TO,
-    )?;
+    let mut stream = inotify.into_event_stream([0u8; 4096])?;
+    let mut watches = stream.watches();
+    let mut armed = arm(&mut watches, &dir)?;
 
     tokio::spawn(async move {
-        let mut stream = match inotify.into_event_stream([0u8; 4096]) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(error = %e, "failed to create inotify event stream");
-                return;
-            }
-        };
-
+        use inotify::EventMask;
         use tokio_stream::StreamExt;
-        while let Some(Ok(event)) = stream.next().await {
-            if event.name.as_ref() == Some(&std::ffi::OsStr::new(&filename).into()) {
-                let _ = tx.send(()).await;
+
+        let mut deadline: Option<tokio::time::Instant> = None;
+        loop {
+            let event = match deadline {
+                Some(at) => tokio::select! {
+                    event = stream.next() => event,
+                    () = tokio::time::sleep_until(at) => {
+                        deadline = None;
+                        if tx.send(()).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                },
+                None => stream.next().await,
+            };
+            let event = match event {
+                Some(Ok(event)) => event,
+                Some(Err(e)) => {
+                    warn!(error = %e, "config watcher read failed; watching stopped");
+                    return;
+                }
+                None => return,
+            };
+            if event.wd != armed.wd {
+                continue;
+            }
+
+            let lost = event
+                .mask
+                .intersects(EventMask::DELETE_SELF | EventMask::MOVE_SELF | EventMask::IGNORED);
+            let for_config_file = event.name.as_deref() == Some(filename.as_os_str());
+
+            if armed.on_config_dir && !lost {
+                if for_config_file {
+                    deadline = Some(tokio::time::Instant::now() + RELOAD_DEBOUNCE);
+                }
+                continue;
+            }
+
+            let previous = armed.wd.clone();
+            match arm(&mut watches, &dir) {
+                Ok(next) => {
+                    if next.wd != previous && !lost {
+                        let _ = watches.remove(previous);
+                    }
+                    let found = next.on_config_dir && !armed.on_config_dir;
+                    armed = next;
+                    if found {
+                        info!(dir = %dir.display(), "config directory appeared; watching it");
+                        if config_file.exists() {
+                            deadline = Some(tokio::time::Instant::now() + RELOAD_DEBOUNCE);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, dir = %dir.display(), "config watcher lost its directory; watching stopped");
+                    return;
+                }
             }
         }
     });
@@ -205,6 +338,88 @@ pub async fn watch_config(path: &Path) -> Result<tokio::sync::mpsc::Receiver<()>
 mod tests {
     use super::*;
     use crate::config::{Config, MatchCriteria, PolicyConfig, Rule};
+
+    fn parse_error(yaml: &str) -> String {
+        let error = serde_yaml_ng::from_str::<Config>(yaml).unwrap_err();
+        with_hint(error).to_string()
+    }
+
+    #[test]
+    fn map_in_key_position_gets_a_hint() {
+        let message = parse_error("version: 1\nrules:\n  - {executable: [plasmashell]}: ignore\n");
+        assert!(message.contains("expected field identifier"), "{message}");
+        assert!(message.contains("hint:"), "{message}");
+        assert!(message.contains("`id`, `match` and `policy`"), "{message}");
+    }
+
+    #[test]
+    fn misplaced_policy_field_gets_a_hint() {
+        let message = parse_error(
+            "version: 1\nrules:\n  - id: x\n    match: {app_id: [x]}\n    use_profile: ignore\n",
+        );
+        assert!(message.contains("unknown field `use_profile`"), "{message}");
+        assert!(message.contains("hint:"), "{message}");
+    }
+
+    #[test]
+    fn errors_outside_rules_are_left_alone() {
+        let message = parse_error("version: one\n");
+        assert!(!message.contains("hint:"), "{message}");
+    }
+
+    async fn expect_reload(rx: &mut tokio::sync::mpsc::Receiver<()>, what: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for reload: {what}"))
+            .expect("watcher alive");
+    }
+
+    async fn expect_quiet(rx: &mut tokio::sync::mpsc::Receiver<()>, what: &str) {
+        let got = tokio::time::timeout(RELOAD_DEBOUNCE * 3, rx.recv()).await;
+        assert!(got.is_err(), "unexpected extra reload: {what}");
+    }
+
+    fn temp_config_root(name: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("app-powerd-watch-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[tokio::test]
+    async fn truncate_then_write_reloads_once() {
+        let root = temp_config_root("debounce");
+        let path = root.join("config.yaml");
+        std::fs::write(&path, "version: 1\n").unwrap();
+        let mut rx = watch_config(&path).await.unwrap();
+
+        // Two separate writes in quick succession, as a script would do.
+        std::fs::File::create(&path).unwrap();
+        std::fs::write(&path, "version: 1\n").unwrap();
+
+        expect_reload(&mut rx, "after writes").await;
+        expect_quiet(&mut rx, "both writes must collapse into one reload").await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn directory_created_after_start_is_watched() {
+        let root = temp_config_root("late-dir");
+        let path = root.join("nested").join("app-powerd").join("config.yaml");
+        let mut rx = watch_config(&path)
+            .await
+            .expect("watcher starts without the directory");
+
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        std::fs::write(&path, "version: 1\n").unwrap();
+        expect_reload(&mut rx, "file written in a newly created directory").await;
+
+        std::fs::write(&path, "version: 1\n").unwrap();
+        expect_reload(&mut rx, "later edits are still seen").await;
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn validate_rejects_wrong_version() {

@@ -194,13 +194,13 @@ fn toplevel_to_window_info(
     if !toplevel.app_id.is_empty() {
         if let Some(cached) = pid_cache.get(&toplevel.app_id) {
             info.pid = Some(cached.pid);
-            info.executable = Some(cached.info.exe.clone());
+            info.executable = Some(cached.info.exe.clone()).filter(|exe| !exe.is_empty());
             info.cmdline = cached.info.cmdline.clone();
         } else if let Some(pid) = find_pid_by_app_id(&toplevel.app_id) {
-            let exe = crate::system::process::exe_name(pid).unwrap_or_default();
+            let exe = crate::system::process::process_name(pid).unwrap_or_default();
             let cmdline = crate::system::process::cmdline(pid).ok();
             info.pid = Some(pid);
-            info.executable = Some(exe.clone());
+            info.executable = Some(exe.clone()).filter(|exe| !exe.is_empty());
             info.cmdline = cmdline.clone();
             pid_cache.insert(
                 toplevel.app_id.clone(),
